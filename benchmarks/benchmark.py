@@ -43,7 +43,22 @@ except ImportError:
     import data
     import models
 
+import syft
+from syft.frameworks import crypten as syft_crypten
+from syft.workers.node_client import NodeClient
+
+
+torch_hook = syft.TorchHook(torch)
+
 Runtime = namedtuple("Runtime", "mid q1 q3")
+
+
+# alice = syft.VirtualWorker(torch_hook, "alice")
+# bob = syft.VirtualWorker(torch_hook, "bob")
+alice = NodeClient(torch_hook, "ws://localhost:3000")
+bob = NodeClient(torch_hook, "ws://localhost:3001")
+WORKERS = [alice, bob]
+IP = "127.0.0.1"
 
 
 def time_me(func=None, n_loops=10):
@@ -73,234 +88,6 @@ def time_me(func=None, n_loops=10):
         return runtime, return_val
 
     return timing_wrapper
-
-
-class FuncBenchmarks:
-    """Benchmarks runtime and error of crypten functions against PyTorch
-
-    Args:
-        tensor_size (int or tuple): size of tensor for benchmarking runtimes
-    """
-
-    BINARY = ["add", "sub", "mul", "matmul", "gt", "lt", "eq"]
-
-    UNARY = [
-        "sigmoid",
-        "relu",
-        "tanh",
-        "exp",
-        "log",
-        "reciprocal",
-        "cos",
-        "sin",
-        "sum",
-        "mean",
-        "neg",
-    ]
-
-    LAYERS = ["conv2d"]
-
-    DOMAIN = torch.arange(start=0.01, end=100, step=0.01)
-    # for exponential, sin, and cos
-    TRUNCATED_DOMAIN = torch.arange(start=0.001, end=10, step=0.001)
-
-    def __init__(self, tensor_size=(100, 100)):
-        self.tensor_size = tensor_size
-        crypten.init()
-        # dataframe for benchmarks
-        self.df = None
-
-    def __repr__(self):
-        if self.df is not None:
-            return self.df.to_string(index=False, justify="left")
-        return "No Function Benchmarks"
-
-    @staticmethod
-    @time_me
-    def time_func(x, func, y=None):
-        """Invokes func as a method of x"""
-        if y is None:
-            return getattr(x, func)()
-
-        if func in {"conv1d", "conv2d"}:
-            if torch.is_tensor(x):
-                return getattr(torch.nn.functional, func)(x, y)
-            return getattr(x, func)(y)
-
-        return getattr(x, func)(y)
-
-    def get_runtimes(self):
-        """Returns plain text and crypten runtimes"""
-        x, y = torch.rand(self.tensor_size), torch.rand(self.tensor_size)
-        x_enc, y_enc = crypten.cryptensor(x), crypten.cryptensor(y)
-
-        runtimes, runtimes_enc = [], []
-
-        for func in FuncBenchmarks.UNARY + FuncBenchmarks.BINARY:
-            second_operand, second_operand_enc = None, None
-            if func in FuncBenchmarks.BINARY:
-                second_operand, second_operand_enc = y, y_enc
-
-            runtime, _ = FuncBenchmarks.time_func(x, func, y=second_operand)
-            runtimes.append(runtime)
-
-            runtime_enc, _ = FuncBenchmarks.time_func(x_enc, func, y=second_operand_enc)
-            runtimes_enc.append(runtime_enc)
-
-        # add layer runtimes
-        runtime_layers, runtime_layers_enc = self.get_layer_runtimes()
-        runtimes.extend(runtime_layers)
-        runtimes_enc.extend(runtime_layers_enc)
-
-        return runtimes, runtimes_enc
-
-    def get_layer_runtimes(self):
-        """Returns runtimes for layers"""
-
-        runtime_layers, runtime_layers_enc = [], []
-
-        for layer in FuncBenchmarks.LAYERS:
-            if layer == "conv1d":
-                x, x_enc, y, y_enc = self.random_conv1d_inputs()
-            elif layer == "conv2d":
-                x, x_enc, y, y_enc = self.random_conv2d_inputs()
-            else:
-                raise ValueError(f"{layer} not supported")
-
-            runtime, _ = FuncBenchmarks.time_func(x, layer, y=y)
-            runtime_enc, _ = FuncBenchmarks.time_func(x_enc, layer, y=y_enc)
-
-            runtime_layers.append(runtime)
-            runtime_layers_enc.append(runtime_enc)
-
-        return runtime_layers, runtime_layers_enc
-
-    def random_conv2d_inputs(self):
-        """Returns random input and weight tensors for 2d convolutions"""
-        filter_size = [size // 10 for size in self.tensor_size]
-        x_conv2d = torch.rand(1, 1, *self.tensor_size)
-        weight2d = torch.rand(1, 1, *filter_size)
-        x_conv2d_enc = crypten.cryptensor(x_conv2d)
-        weight2d_enc = crypten.cryptensor(weight2d)
-        return x_conv2d, x_conv2d_enc, weight2d, weight2d_enc
-
-    def random_conv1d_inputs(self):
-        """Returns random input and weight tensors for 1d convolutions"""
-        size = self.tensor_size[0]
-        filter_size = size // 10
-        (x_conv1d,) = torch.rand(1, 1, size)
-        weight1d = torch.rand(1, 1, filter_size)
-        x_conv1d_enc = crypten.cryptensor(x_conv1d)
-        weight1d_enc = crypten.cryptensor(weight1d)
-        return x_conv1d, x_conv1d_enc, weight1d, weight1d_enc
-
-    @staticmethod
-    def calc_abs_error(ref, out):
-        """Computes total absolute error"""
-        if ref.dtype == torch.bool:
-            errors = (out != ref).sum().numpy()
-            return errors
-        errors = torch.abs(out - ref).numpy()
-        return errors.sum()
-
-    @staticmethod
-    def calc_relative_error(ref, out):
-        """Computes average relative error"""
-        if ref.dtype == torch.bool:
-            errors = ((out != ref).sum() // ref.nelement()).numpy()
-            return errors
-        errors = torch.abs((out - ref) / ref)
-        # remove inf due to division by tiny numbers
-        errors = errors[errors != float("inf")].numpy()
-        return errors.mean()
-
-    def call_function_on_domain(self, func):
-        """Call plain text and CrypTen function on given function
-        Uses DOMAIN, TRUNCATED_DOMAIN, or appropriate layer inputs
-
-        Returns: tuple of (plain text result, encrypted result)
-        """
-        DOMAIN, TRUNCATED_DOMAIN = (
-            FuncBenchmarks.DOMAIN,
-            FuncBenchmarks.TRUNCATED_DOMAIN,
-        )
-        y = torch.rand(DOMAIN.shape)
-        DOMAIN_enc, y_enc = crypten.cryptensor(DOMAIN), crypten.cryptensor(y)
-        TRUNCATED_DOMAIN_enc = crypten.cryptensor(TRUNCATED_DOMAIN)
-
-        if func in ["exp", "cos", "sin"]:
-            ref, out_enc = (
-                getattr(TRUNCATED_DOMAIN, func)(),
-                getattr(TRUNCATED_DOMAIN_enc, func)(),
-            )
-        elif func in FuncBenchmarks.UNARY:
-            ref, out_enc = getattr(DOMAIN, func)(), getattr(DOMAIN_enc, func)()
-        elif func in FuncBenchmarks.LAYERS:
-            ref, out_enc = self._call_layer(func)
-        elif func in FuncBenchmarks.BINARY:
-            ref, out_enc = (getattr(DOMAIN, func)(y), getattr(DOMAIN_enc, func)(y_enc))
-        else:
-            raise ValueError(f"{func} not supported")
-
-        return ref, out_enc
-
-    def get_errors(self):
-        """Computes the total error of approximations"""
-        abs_errors, relative_errors = [], []
-
-        functions = FuncBenchmarks.UNARY + FuncBenchmarks.BINARY
-        functions += FuncBenchmarks.LAYERS
-
-        for func in functions:
-            ref, out_enc = self.call_function_on_domain(func)
-            out = out_enc.get_plain_text()
-
-            abs_error = FuncBenchmarks.calc_abs_error(ref, out)
-            abs_errors.append(abs_error)
-
-            relative_error = FuncBenchmarks.calc_relative_error(ref, out)
-            relative_errors.append(relative_error)
-
-        return abs_errors, relative_errors
-
-    def _call_layer(self, layer):
-        """Call supported layers"""
-        if layer == "conv1d":
-            x, x_enc, y, y_enc = self.random_conv1d_inputs()
-        elif layer == "conv2d":
-            x, x_enc, y, y_enc = self.random_conv2d_inputs()
-        else:
-            raise ValueError(f"{layer} not supported")
-
-        ref = getattr(torch.nn.functional, layer)(x, y)
-        out_enc = getattr(x_enc, layer)(y_enc)
-
-        return ref, out_enc
-
-    def save(self, path):
-        self.df.to_csv(os.path.join(path, "func_benchmarks.csv"), index=False)
-
-    def run(self):
-        """Runs and stores benchmarks in self.df"""
-        runtimes, runtimes_enc = self.get_runtimes()
-
-        abs_errors, relative_errors = self.get_errors()
-
-        self.df = pd.DataFrame.from_dict(
-            {
-                "function": FuncBenchmarks.UNARY
-                + FuncBenchmarks.BINARY
-                + FuncBenchmarks.LAYERS,
-                "runtime": [r.mid for r in runtimes],
-                "runtime Q1": [r.q1 for r in runtimes],
-                "runtime Q3": [r.q3 for r in runtimes],
-                "runtime crypten": [r.mid for r in runtimes_enc],
-                "runtime crypten Q1": [r.q1 for r in runtimes_enc],
-                "runtime crypten Q3": [r.q3 for r in runtimes_enc],
-                "total abs error": abs_errors,
-                "average relative error": relative_errors,
-            }
-        )
 
 
 class ModelBenchmarks:
@@ -366,7 +153,7 @@ class ModelBenchmarks:
         """Trains crypten encrypted model
 
         Args:
-            model (CrypTen model): model to be trained
+            model (PyTorch model): model to be trained
             x (crypten.tensor): inputs
             y (crypten.tensor): targets
             epochs (int): number of training epochs
@@ -376,16 +163,48 @@ class ModelBenchmarks:
         Returns:
             model with update weights
         """
-        assert isinstance(model, crypten.nn.Module), "must be a CrypTen model"
-        criterion = getattr(crypten.nn, loss)()
+        assert isinstance(model, torch.nn.Module), "must be a PyTorch model"
+        # criterion = getattr(crypten.nn, loss)()
 
-        for _ in range(epochs):
-            model.zero_grad()
-            output = model(x)
-            loss = criterion(output, y)
-            loss.backward()
-            model.update_parameters(lr)
+        # for _ in range(epochs):
+        #     model.zero_grad()
+        #     output = model(x)
+        #     loss = criterion(output, y)
+        #     loss.backward()
+        #     model.update_parameters(lr)
 
+        epochs = torch.tensor(epochs)
+        epochs.tag("epochs")
+        ptrs = []
+        for worker in WORKERS:
+            ptrs.append(epochs.send(worker))
+
+        @syft_crypten.context.run_multiworkers(WORKERS, master_addr=IP, model=model, dummy_input=x)
+        def training():
+            rank = crypten.communicator.get().get_rank()
+            worker = syft.frameworks.crypten.get_worker_from_rank(rank)
+            epochs = worker.search("epochs")[0]
+
+            x = crypten.load("x", 0)
+            y = crypten.load("y", 0)
+
+            model.encrypt()
+            criterion = crypten.nn.BCELoss()
+            for _ in range(epochs):
+                model.zero_grad()
+                output = model(x)
+                loss = criterion(output, y)
+                loss.backward()
+                model.update_parameters(0.1)
+
+            model.decrypt()
+            return model
+
+        result = training()
+        # remove epochs
+        for ptr in ptrs:
+            _ = ptr.get()
+        model = result[0]
         return model
 
     def time_training(self):
@@ -400,17 +219,40 @@ class ModelBenchmarks:
             runtimes.append(runtime)
 
             x_enc, y_enc = model.data.x_enc, model.data.y_enc
-            model_enc = model.crypten().encrypt()
+            # prepare data
+            x = x_enc.get_plain_text()
+            x.tag("x")
+            y = y_enc.get_plain_text()
+            y.tag("y")
+            x_ptr = x.send(WORKERS[0])
+            y_ptr = y.send(WORKERS[0])
+
             runtime_enc, _ = self.train_crypten(
-                model_enc, x_enc, y_enc, 1, model.lr, model.loss
+                model_plain, x, y, 1, model.lr, model.loss
             )
             runtimes_enc.append(runtime_enc)
+
+            # remove remote tensors
+            _ = x_ptr.get()
+            _ = y_ptr.get()
 
         return runtimes, runtimes_enc
 
     @time_me(n_loops=3)
-    def predict(self, model, x):
+    def predict_plain(self, model, x):
         y = model(x)
+        return y
+
+    @time_me(n_loops=3)
+    def predict_enc(self, model, x):
+        @syft_crypten.context.run_multiworkers(WORKERS, master_addr=IP, model=model, dummy_input=x)
+        def pred():
+            model.encrypt()
+            x = crypten.load("x", 0)
+            y = model(x)
+            return y.get_plain_text()
+        result = pred()
+        y = result[0]
         return y
 
     def time_inference(self):
@@ -420,12 +262,17 @@ class ModelBenchmarks:
 
         for model in self.models:
             model_plain = model.plain()
-            runtime, _ = self.predict(model_plain, model.data.x)
+            runtime, _ = self.predict_plain(model_plain, model.data.x)
             runtimes.append(runtime)
 
-            model_enc = model.crypten().encrypt()
-            runtime_enc, _ = self.predict(model_enc, model.data.x_enc)
+            x = model.data.x
+            x.tag("x")
+            ptr = x.send(WORKERS[0])
+            
+            runtime_enc, _ = self.predict_enc(model_plain, model.data.x)
             runtimes_enc.append(runtime_enc)
+
+            _ = ptr.get()
 
         return runtimes, runtimes_enc
 
@@ -460,13 +307,26 @@ class ModelBenchmarks:
             accuracy = ModelBenchmarks.calc_accuracy(model_plain(x_test), y_test)
             accuracies.append(accuracy)
 
-            model_crypten = model.crypten().encrypt()
+            x_enc, y_enc = model.data.x_enc, model.data.y_enc
+            # prepare data
+            x = x_enc.get_plain_text()
+            x.tag("x")
+            y = y_enc.get_plain_text()
+            y.tag("y")
+            x_ptr = x.send(WORKERS[0])
+            y_ptr = y.send(WORKERS[0])
+
+            _, model_crypten = self.train_crypten(
+                model_plain, x, y, model.epochs, model.lr, model.loss
+            )
+
             x_enc, y_enc = model.data.x_enc, model.data.y_enc
             _, model_crypten = self.train_crypten(
-                model_crypten, x_enc, y_enc, model.epochs, model.lr, model.loss
+                model_plain, x, y, model.epochs, model.lr, model.loss
             )
             x_test_enc = model.data.x_test_enc
 
+            model_crypten.encrypt()
             output = model_crypten(x_test_enc).get_plain_text()
             accuracy = ModelBenchmarks.calc_accuracy(output, y_test)
             accuracies_crypten.append(accuracy)
@@ -515,22 +375,6 @@ def get_args():
         help="path to save function benchmarks",
     )
     parser.add_argument(
-        "--only-functions",
-        "-f",
-        required=False,
-        default=False,
-        action="store_true",
-        help="run only function benchmarks",
-    )
-    parser.add_argument(
-        "--world-size",
-        "-w",
-        type=int,
-        required=False,
-        default=1,
-        help="world size for number of parties",
-    )
-    parser.add_argument(
         "--advanced-models",
         required=False,
         default=False,
@@ -541,45 +385,19 @@ def get_args():
     return args
 
 
-def multiprocess_caller(args):
-    """Runs multiparty benchmarks and prints/saves from source 0"""
-    for benchmark in args.benchmarks:
-        benchmark.run()
-        rank = comm.get().get_rank()
-        if rank == 0:
-            pd.set_option("display.precision", 3)
-            print(benchmark)
-            if args.path:
-                benchmark.save(args.path)
-
-
 def main():
     """Runs benchmarks and saves if path is provided"""
     args = get_args()
     benchmarks = [
-        FuncBenchmarks(),
         ModelBenchmarks(advanced_models=args.advanced_models),
     ]
 
-    if args.only_functions:
-        benchmarks = [FuncBenchmarks()]
-
-    if args.world_size > 1:
-        args.benchmarks = benchmarks
-        launcher = multiprocess_launcher.MultiProcessLauncher(
-            args.world_size, multiprocess_caller, fn_args=args
-        )
-        launcher.start()
-        launcher.join()
-        launcher.terminate()
-
-    else:
-        pd.set_option("display.precision", 3)
-        for benchmark in benchmarks:
-            benchmark.run()
-            print(benchmark)
-            if args.path:
-                benchmark.save(args.path)
+    pd.set_option("display.precision", 3)
+    for benchmark in benchmarks:
+        benchmark.run()
+        print(benchmark)
+        if args.path:
+            benchmark.save(args.path)
 
 
 if __name__ == "__main__":
