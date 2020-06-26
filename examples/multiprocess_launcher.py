@@ -22,8 +22,12 @@ class MultiProcessLauncher:
         multiprocessing.set_start_method("spawn")
 
         # Use random file so multiple jobs can be run simultaneously
-        INIT_METHOD = "file:///tmp/crypten-rendezvous-{}".format(uuid.uuid1())
-        env["RENDEZVOUS"] = INIT_METHOD
+        #INIT_METHOD = "file:///tmp/crypten-rendezvous-{}".format(uuid.uuid1())
+        #env["RENDEZVOUS"] = INIT_METHOD
+        env["RENDEZVOUS"] = "env://"
+        env["MASTER_ADDR"] = "127.0.0.1"
+        env["MASTER_PORT"] = "15987"
+        env["DISTRIBUTED_BACKEND"] = "gloo"
 
         self.processes = []
         for rank in range(world_size):

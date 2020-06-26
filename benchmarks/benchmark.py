@@ -557,7 +557,7 @@ def main():
     """Runs benchmarks and saves if path is provided"""
     args = get_args()
     benchmarks = [
-        FuncBenchmarks(),
+        #FuncBenchmarks(),
         ModelBenchmarks(advanced_models=args.advanced_models),
     ]
 
